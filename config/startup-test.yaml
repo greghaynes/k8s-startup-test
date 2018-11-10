@@ -1,0 +1,17 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: startup-test
+spec:
+  template:
+    metadata:
+      labels:
+        app: startup-test
+    spec:
+      serviceAccountName: startup-test
+      containers:
+      - name: startup-test
+        image: github.com/greghaynes/startup-test/cmd/startup-test
+      - name: in-container-dummy
+        image: github.com/greghaynes/startup-test/cmd/in-container
+      restartPolicy: Never

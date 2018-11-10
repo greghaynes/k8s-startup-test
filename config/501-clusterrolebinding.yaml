@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: startup-test-admin
+subjects:
+  - kind: ServiceAccount
+    name: startup-test
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: startup-test-admin
+  apiGroup: rbac.authorization.k8s.io
