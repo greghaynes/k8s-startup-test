@@ -11,7 +11,7 @@ spec:
       serviceAccountName: startup-test
       containers:
       - name: startup-test
-        image: github.com/greghaynes/startup-test/cmd/startup-test
+        image: github.com/greghaynes/k8s-startup-test/cmd/startup-test
       - name: in-container-dummy
-        image: github.com/greghaynes/startup-test/cmd/in-container
+        image: github.com/greghaynes/k8s-startup-test/cmd/in-container
       restartPolicy: Never

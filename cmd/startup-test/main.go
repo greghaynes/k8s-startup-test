@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	apiv1 "k8s.io/api/core/v1"
@@ -53,7 +56,7 @@ func testPod(owner *batchv1.Job, target *apiv1.Pod) (*apiv1.Pod, error) {
 					Env: []apiv1.EnvVar{
 						{
 							Name:  "TARGET_HOST",
-							Value: fmt.Sprintf("%s.%s.pod.cluster.local", target.Name, "default"),
+							Value: target.Status.PodIP,
 						},
 					},
 				},
@@ -63,17 +66,47 @@ func testPod(owner *batchv1.Job, target *apiv1.Pod) (*apiv1.Pod, error) {
 	return &pod, nil
 }
 
-func runTest(podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Pod) *apiv1.Pod {
+type httpSrv struct {
+	stopCh chan struct{}
+}
+
+func (srv httpSrv) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	fmt.Fprintf(w, "Hello!")
+	close(srv.stopCh)
+}
+
+func runTest(podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Pod) time.Duration {
 	log.Printf("Running test")
+
+	stopCh := make(chan struct{})
+	srv := http.Server{
+		Handler: httpSrv{stopCh},
+	}
+	go func() {
+		srv.ListenAndServe()
+	}()
+
 	podDef, err := testPod(myJob, myPod)
 	if err != nil {
 		log.Fatalf("Error creating pod definition: %v", err)
 	}
-	pod, err := podsClient.Create(podDef)
+
+	start := time.Now()
+	_, err = podsClient.Create(podDef)
 	if err != nil {
 		log.Fatalf("Error creating test pod: %v", err)
 	}
-	return pod
+
+	log.Printf("Waiting for request")
+	<-stopCh
+	stop := time.Now()
+
+	elapsed := stop.Sub(start)
+	log.Printf("Elapsed time: %v", elapsed)
+
+	srv.Shutdown(context.TODO())
+
+	return elapsed
 }
 
 func main() {
@@ -94,17 +127,27 @@ func main() {
 	}
 
 	podsClient := kubeClient.Core().Pods("default")
-	myPods, err := podsClient.List(metav1.ListOptions{
-		LabelSelector: "app=startup-test",
-	})
-	if err != nil {
-		log.Fatalf("Error getting list of pods for our job: %v", err)
-	}
-	if len(myPods.Items) != 1 {
-		log.Fatalf("Got multiple pods for our job: %v", myPods)
-	}
 
-	myPod := &myPods.Items[0]
+	var myPod *apiv1.Pod
+	for {
+		myPods, err := podsClient.List(metav1.ListOptions{
+			LabelSelector: "app=startup-test",
+		})
+		if err != nil {
+			log.Fatalf("Error getting list of pods for our job: %v", err)
+		}
+		if len(myPods.Items) != 1 {
+			log.Fatalf("Got multiple pods for our job: %v", myPods)
+		}
+
+		myPod = &myPods.Items[0]
+		if myPod.Status.PodIP == "" {
+			log.Printf("No PodIP in status, waiting.")
+			time.Sleep(1 * time.Second)
+		} else {
+			break
+		}
+	}
 
 	runTest(podsClient, myJob, myPod)
 }
