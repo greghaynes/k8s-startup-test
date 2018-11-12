@@ -19,6 +19,7 @@ import (
 var (
 	masterURL  = flag.String("master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
 	kubeconfig = flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
+	iterations = flag.Int("iterations", 10, "Number of testing iterations to perform.")
 )
 
 func inContainerImage(job *batchv1.Job) string {
@@ -30,22 +31,27 @@ func inContainerImage(job *batchv1.Job) string {
 	return ""
 }
 
-func testPod(owner *batchv1.Job, target *apiv1.Pod) (*apiv1.Pod, error) {
+func ownerReference(owner *batchv1.Job) *metav1.OwnerReference {
+	ownerRef := metav1.OwnerReference{
+		APIVersion: "batch/v1",
+		Kind:       "Job",
+		Name:       owner.ObjectMeta.Name,
+		UID:        owner.ObjectMeta.UID,
+	}
+	return &ownerRef
+}
+
+func testPod(owner *batchv1.Job, target *apiv1.Pod, secret string) (*apiv1.Pod, error) {
 	inContainerImage := inContainerImage(owner)
 	if inContainerImage == "" {
 		return nil, fmt.Errorf("Unable to obtain in-container image.")
 	}
 	pod := apiv1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-pod",
-			Namespace: "default",
+			GenerateName: "test-pod",
+			Namespace:    "default",
 			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: "batch/v1",
-					Kind:       "Job",
-					Name:       owner.ObjectMeta.Name,
-					UID:        owner.ObjectMeta.UID,
-				},
+				*ownerReference(owner),
 			},
 		},
 		Spec: apiv1.PodSpec{
@@ -58,6 +64,10 @@ func testPod(owner *batchv1.Job, target *apiv1.Pod) (*apiv1.Pod, error) {
 							Name:  "TARGET_HOST",
 							Value: target.Status.PodIP,
 						},
+						{
+							Name:  "SECRET",
+							Value: secret,
+						},
 					},
 				},
 			},
@@ -68,31 +78,37 @@ func testPod(owner *batchv1.Job, target *apiv1.Pod) (*apiv1.Pod, error) {
 
 type httpSrv struct {
 	stopCh chan struct{}
+	secret string
 }
 
 func (srv httpSrv) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	fmt.Fprintf(w, "Hello!")
-	close(srv.stopCh)
+	if req.URL.RawQuery == fmt.Sprintf("secret=%s", srv.secret) {
+		fmt.Fprintf(w, "Hello!")
+		close(srv.stopCh)
+	} else {
+		fmt.Fprintf(w, "Invalid secret!")
+		log.Printf("Got invalid secret: %s", req.URL.RawQuery)
+	}
 }
 
-func runTest(podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Pod) time.Duration {
+func runTest(podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Pod, secret string) time.Duration {
 	log.Printf("Running test")
 
 	stopCh := make(chan struct{})
 	srv := http.Server{
-		Handler: httpSrv{stopCh},
+		Handler: httpSrv{stopCh, secret},
 	}
 	go func() {
 		srv.ListenAndServe()
 	}()
 
-	podDef, err := testPod(myJob, myPod)
+	podDef, err := testPod(myJob, myPod, secret)
 	if err != nil {
 		log.Fatalf("Error creating pod definition: %v", err)
 	}
 
 	start := time.Now()
-	_, err = podsClient.Create(podDef)
+	createdPod, err := podsClient.Create(podDef)
 	if err != nil {
 		log.Fatalf("Error creating test pod: %v", err)
 	}
@@ -105,6 +121,10 @@ func runTest(podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Po
 	log.Printf("Elapsed time: %v", elapsed)
 
 	srv.Shutdown(context.TODO())
+	err = podsClient.Delete(createdPod.ObjectMeta.Name, nil)
+	if err != nil {
+		log.Fatalf("Failed to delete test pod: %v", err)
+	}
 
 	return elapsed
 }
@@ -149,5 +169,10 @@ func main() {
 		}
 	}
 
-	runTest(podsClient, myJob, myPod)
+	results := make([]time.Duration, *iterations)
+	for i := 0; i < *iterations; i++ {
+		results[i] = runTest(podsClient, myJob, myPod, fmt.Sprintf("%d", i))
+	}
+
+	log.Printf("Got results: %v", results)
 }

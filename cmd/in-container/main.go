@@ -8,8 +8,10 @@ import (
 
 func main() {
 	target := fmt.Sprintf("http://%s/", os.Getenv("TARGET_HOST"))
-	fmt.Printf("Performing GET to: %s", target)
-	resp, err := http.Get(target)
+	secret := os.Getenv("SECRET")
+	url := fmt.Sprintf("%s?secret=%s", target, secret)
+	fmt.Printf("Performing GET to: %s", url)
+	resp, err := http.Get(url)
 	if err != nil {
 		fmt.Printf("ERROR: %v", err)
 	} else {
