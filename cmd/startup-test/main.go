@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -17,9 +18,10 @@ import (
 )
 
 var (
-	masterURL  = flag.String("master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
-	kubeconfig = flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	iterations = flag.Int("iterations", 10, "Number of testing iterations to perform.")
+	masterURL   = flag.String("master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	kubeconfig  = flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
+	iterations  = flag.Int("iterations", 100, "Number of testing iterations to perform.")
+	parallelism = flag.Int("parallelism", 1, "Number of tests to run in parallel.")
 )
 
 func inContainerImage(job *batchv1.Job) string {
@@ -77,30 +79,35 @@ func testPod(owner *batchv1.Job, target *apiv1.Pod, secret string) (*apiv1.Pod, 
 }
 
 type httpSrv struct {
-	stopCh chan struct{}
-	secret string
+	mutex    sync.Mutex
+	reqCond  *sync.Cond
+	reqTimes map[string]time.Time
+}
+
+func (srv *httpSrv) WaitForSecret(secret string) time.Time {
+	srv.mutex.Lock()
+	defer srv.mutex.Unlock()
+	waitKey := fmt.Sprintf("secret=%s", secret)
+	log.Printf("Waiting for secret %s", secret)
+	for {
+		reqTime, ok := srv.reqTimes[waitKey]
+		if ok {
+			return reqTime
+		}
+		srv.reqCond.Wait()
+	}
 }
 
 func (srv httpSrv) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if req.URL.RawQuery == fmt.Sprintf("secret=%s", srv.secret) {
-		fmt.Fprintf(w, "Hello!")
-		close(srv.stopCh)
-	} else {
-		fmt.Fprintf(w, "Invalid secret!")
-		log.Printf("Got invalid secret: %s", req.URL.RawQuery)
-	}
+	srv.mutex.Lock()
+	defer srv.mutex.Unlock()
+	srv.reqTimes[req.URL.RawQuery] = time.Now()
+	srv.reqCond.Broadcast()
+	fmt.Fprintf(w, "Got request!")
 }
 
-func runTest(podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Pod, secret string) time.Duration {
+func runSingleTest(srv *httpSrv, podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Pod, secret string) time.Duration {
 	log.Printf("Running test")
-
-	stopCh := make(chan struct{})
-	srv := http.Server{
-		Handler: httpSrv{stopCh, secret},
-	}
-	go func() {
-		srv.ListenAndServe()
-	}()
 
 	podDef, err := testPod(myJob, myPod, secret)
 	if err != nil {
@@ -114,13 +121,11 @@ func runTest(podsClient corev1.PodInterface, myJob *batchv1.Job, myPod *apiv1.Po
 	}
 
 	log.Printf("Waiting for request")
-	<-stopCh
-	stop := time.Now()
+	stop := srv.WaitForSecret(secret)
 
 	elapsed := stop.Sub(start)
-	log.Printf("Elapsed time: %v", elapsed)
+	log.Printf("Elapsed time for %s: %v", secret, elapsed)
 
-	srv.Shutdown(context.TODO())
 	err = podsClient.Delete(createdPod.ObjectMeta.Name, nil)
 	if err != nil {
 		log.Fatalf("Failed to delete test pod: %v", err)
@@ -169,10 +174,55 @@ func main() {
 		}
 	}
 
+	handler := httpSrv{
+		reqTimes: make(map[string]time.Time),
+	}
+	handler.reqCond = sync.NewCond(&handler.mutex)
+	// Start http server
+	srv := http.Server{
+		Handler: handler,
+	}
+	go func() {
+		srv.ListenAndServe()
+	}()
+
+	stopCh := make(chan interface{})
+	workQueue := make(chan int)
+	resultsQueue := make(chan time.Duration)
+
+	// Dispatch work
+	go func() {
+		for i := 0; i < *iterations; i++ {
+			workQueue <- i
+		}
+	}()
+
 	results := make([]time.Duration, *iterations)
-	for i := 0; i < *iterations; i++ {
-		results[i] = runTest(podsClient, myJob, myPod, fmt.Sprintf("%d", i))
+	go func() {
+		for i := 0; i < *iterations; i++ {
+			results[i] = <-resultsQueue
+		}
+		close(stopCh)
+	}()
+
+	for i := 0; i < *parallelism; i++ {
+		go func() {
+			for {
+				select {
+				case testNum := <-workQueue:
+					resultsQueue <- runSingleTest(&handler, podsClient, myJob, myPod, fmt.Sprintf("%d", testNum))
+				case <-stopCh:
+					return
+				}
+			}
+		}()
 	}
 
-	log.Printf("Got results: %v", results)
+	<-stopCh
+	srv.Shutdown(context.TODO())
+	fmt.Printf("Results:\n")
+	for _, res := range results {
+		fmt.Printf("%d,", res/time.Millisecond)
+	}
+	fmt.Printf("\n")
 }
